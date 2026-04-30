@@ -1,0 +1,200 @@
+//@version=6
+indicator(title="OBQ MACD Signals", shorttitle="OBQ-MACD", overlay=false, max_labels_count=500)
+
+// ── INPUTS ────────────────────────────────────────────────────────────────────
+fast_len  = input.int(12,    "Fast Length",    minval=1)
+slow_len  = input.int(26,    "Slow Length",    minval=1)
+sig_len   = input.int(9,     "Signal Length",  minval=1)
+src       = input.source(close, "Source")
+show_div  = input.bool(false, "Show Divergences", tooltip="Last 3 divergence lines on MACD panel")
+piv_left  = input.int(3,     "Pivot Left",    minval=1)
+piv_right = input.int(2,     "Pivot Right",   minval=1)
+export_on = input.bool(false, "Export Labels", tooltip="Enable for forward cloud data export")
+
+// ── 10-YEAR GATE ──────────────────────────────────────────────────────────────
+ten_y = timestamp("UTC", year(timenow) - 10, month(timenow), dayofmonth(timenow), 0, 0)
+in_win = time >= ten_y
+
+// ── MACD CALCULATION ──────────────────────────────────────────────────────────
+fast_ema = ta.ema(src, fast_len)
+slow_ema = ta.ema(src, slow_len)
+macd_line = fast_ema - slow_ema
+sig_line  = ta.ema(macd_line, sig_len)
+hist      = macd_line - sig_line
+
+// ── CROSSOVER SIGNALS (called every bar — Pine v6) ───────────────────────────
+_co_sig  = ta.crossover(macd_line, sig_line)
+_cu_sig  = ta.crossunder(macd_line, sig_line)
+_co_zero = ta.crossover(macd_line, 0)
+_cu_zero = ta.crossunder(macd_line, 0)
+
+sig_bull_cross = in_win and barstate.isconfirmed and _co_sig
+sig_bear_cross = in_win and barstate.isconfirmed and _cu_sig
+sig_above_zero = in_win and barstate.isconfirmed and _co_zero
+sig_below_zero = in_win and barstate.isconfirmed and _cu_zero
+
+// ── HISTOGRAM MOMENTUM SIGNALS ────────────────────────────────────────────────
+hist_prev = hist[1]
+hist_expanding_bull  = in_win and barstate.isconfirmed and hist > 0 and hist > hist_prev
+hist_expanding_bear  = in_win and barstate.isconfirmed and hist < 0 and hist < hist_prev
+hist_contract_bull   = in_win and barstate.isconfirmed and hist < 0 and hist > hist_prev
+hist_contract_bear   = in_win and barstate.isconfirmed and hist > 0 and hist < hist_prev
+
+// ── PIVOTS (top level — Pine v6) ─────────────────────────────────────────────
+pp_low   = ta.pivotlow(low, piv_left, piv_right)
+pp_high  = ta.pivothigh(high, piv_left, piv_right)
+hp_low   = ta.pivotlow(hist, piv_left, piv_right)
+hp_high  = ta.pivothigh(hist, piv_left, piv_right)
+
+// ── PIVOT STORAGE ─────────────────────────────────────────────────────────────
+var float[] lp_price = array.new_float(0)
+var float[] lp_hist  = array.new_float(0)
+var int[]   lp_bar   = array.new_int(0)
+var float[] hp_price = array.new_float(0)
+var float[] hp_hist  = array.new_float(0)
+var int[]   hp_bar   = array.new_int(0)
+
+if not na(pp_low) and not na(hp_low) and in_win and barstate.isconfirmed
+    array.push(lp_price, pp_low)
+    array.push(lp_hist, hp_low)
+    array.push(lp_bar, bar_index - piv_right)
+    if array.size(lp_price) > 20
+        array.shift(lp_price)
+        array.shift(lp_hist)
+        array.shift(lp_bar)
+
+if not na(pp_high) and not na(hp_high) and in_win and barstate.isconfirmed
+    array.push(hp_price, pp_high)
+    array.push(hp_hist, hp_high)
+    array.push(hp_bar, bar_index - piv_right)
+    if array.size(hp_price) > 20
+        array.shift(hp_price)
+        array.shift(hp_hist)
+        array.shift(hp_bar)
+
+// ── DIVERGENCE DETECTION ──────────────────────────────────────────────────────
+bull_div     = false
+bear_div     = false
+bull_hist_val = float(na)
+bear_hist_val = float(na)
+
+// Bullish: price lower low + histogram higher low
+if not na(pp_low) and not na(hp_low) and in_win and barstate.isconfirmed
+    int n = array.size(lp_price)
+    if n >= 2
+        for i = 0 to n - 2
+            if pp_low < array.get(lp_price, i) and hp_low > array.get(lp_hist, i)
+                bull_div := true
+                bull_hist_val := hp_low
+                break
+
+// Bearish: price higher high + histogram lower high
+if not na(pp_high) and not na(hp_high) and in_win and barstate.isconfirmed
+    int n2 = array.size(hp_price)
+    if n2 >= 2
+        for i = 0 to n2 - 2
+            if pp_high > array.get(hp_price, i) and hp_high < array.get(hp_hist, i)
+                bear_div := true
+                bear_hist_val := hp_high
+                break
+
+// ── DIVERGENCE LINES (last 3) ─────────────────────────────────────────────────
+var int[]   d_b1 = array.new_int(0)
+var float[] d_h1 = array.new_float(0)
+var int[]   d_b2 = array.new_int(0)
+var float[] d_h2 = array.new_float(0)
+var int[]   d_tp = array.new_int(0)
+
+if bull_div
+    int nl = array.size(lp_bar)
+    if nl >= 2
+        array.push(d_b1, array.get(lp_bar, nl - 2))
+        array.push(d_h1, array.get(lp_hist, nl - 2))
+        array.push(d_b2, bar_index - piv_right)
+        array.push(d_h2, bull_hist_val)
+        array.push(d_tp, 1)
+        while array.size(d_b1) > 3
+            array.shift(d_b1)
+            array.shift(d_h1)
+            array.shift(d_b2)
+            array.shift(d_h2)
+            array.shift(d_tp)
+
+if bear_div
+    int nh = array.size(hp_bar)
+    if nh >= 2
+        array.push(d_b1, array.get(hp_bar, nh - 2))
+        array.push(d_h1, array.get(hp_hist, nh - 2))
+        array.push(d_b2, bar_index - piv_right)
+        array.push(d_h2, bear_hist_val)
+        array.push(d_tp, -1)
+        while array.size(d_b1) > 3
+            array.shift(d_b1)
+            array.shift(d_h1)
+            array.shift(d_b2)
+            array.shift(d_h2)
+            array.shift(d_tp)
+
+var line[] div_lines = array.new_line(0)
+if barstate.islast
+    int ld = array.size(div_lines)
+    if ld > 0
+        for i = 0 to ld - 1
+            line.delete(array.get(div_lines, i))
+    array.clear(div_lines)
+    if show_div
+        int nd = array.size(d_b1)
+        if nd > 0
+            for i = 0 to nd - 1
+                color col = array.get(d_tp, i) == 1 ? color.new(#00C853, 0) : color.new(#D32F2F, 0)
+                line ln = line.new(array.get(d_b1, i), array.get(d_h1, i), array.get(d_b2, i), array.get(d_h2, i), xloc=xloc.bar_index, color=col, width=2, style=line.style_dashed)
+                array.push(div_lines, ln)
+
+// ── EXPORT LABELS ─────────────────────────────────────────────────────────────
+if export_on and barstate.isconfirmed and in_win
+    string sig = ""
+    float val = macd_line
+    if sig_bull_cross
+        sig := "MACD_BULL_CROSS"
+    else if sig_bear_cross
+        sig := "MACD_BEAR_CROSS"
+    else if sig_above_zero
+        sig := "MACD_ABOVE_ZERO"
+    else if sig_below_zero
+        sig := "MACD_BELOW_ZERO"
+    else if hist_expanding_bull
+        sig := "MACD_HIST_EXPAND_BULL"
+    else if hist_expanding_bear
+        sig := "MACD_HIST_EXPAND_BEAR"
+    else if hist_contract_bull
+        sig := "MACD_HIST_CONTRACT_BULL"
+    else if hist_contract_bear
+        sig := "MACD_HIST_CONTRACT_BEAR"
+    else if bull_div
+        sig := "MACD_BULL_DIV"
+        val := bull_hist_val
+    else if bear_div
+        sig := "MACD_BEAR_DIV"
+        val := bear_hist_val
+    if sig != ""
+        label.new(bar_index, val, str.format("{0}|{1}|{2}|{3}", sig, str.format_time(time, "yyyy-MM-dd", "UTC"), str.tostring(math.round(close, 2)), str.tostring(math.round(val, 4))), style=label.style_label_down, color=color.new(color.gray, 90), textcolor=color.new(color.gray, 90), size=size.tiny)
+
+// ── PLOTS ─────────────────────────────────────────────────────────────────────
+// Histogram bars
+hist_color = hist >= 0 ? (hist > hist_prev ? color.new(#26A69A, 0) : color.new(#B2DFDB, 0)) : (hist < hist_prev ? color.new(#EF5350, 0) : color.new(#FFCDD2, 0))
+plot(hist, title="Histogram", style=plot.style_columns, color=hist_color)
+
+// MACD and Signal lines
+plot(macd_line, title="MACD", color=color.new(#2962FF, 0), linewidth=2)
+plot(sig_line, title="Signal", color=color.new(#FF6D00, 0), linewidth=1)
+
+// Zero line
+hline(0, "Zero", color=color.new(color.gray, 60), linestyle=hline.style_dotted)
+
+// ── SIGNAL DOTS ───────────────────────────────────────────────────────────────
+plotshape(sig_bull_cross, title="Bull Cross", style=shape.circle, location=location.absolute, color=#00C853, size=size.tiny)
+plotshape(sig_bear_cross, title="Bear Cross", style=shape.circle, location=location.absolute, color=#D32F2F, size=size.tiny)
+plotshape(sig_above_zero, title="Above Zero", style=shape.circle, location=location.absolute, color=#00BCD4, size=size.tiny)
+plotshape(sig_below_zero, title="Below Zero", style=shape.circle, location=location.absolute, color=#7B1FA2, size=size.tiny)
+plotshape(bull_div ? bull_hist_val : na, title="Bull Div", style=shape.triangleup, location=location.absolute, color=#00E676, size=size.small)
+plotshape(bear_div ? bear_hist_val : na, title="Bear Div", style=shape.triangledown, location=location.absolute, color=#FF1744, size=size.small)

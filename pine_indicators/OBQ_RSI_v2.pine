@@ -1,0 +1,189 @@
+//@version=6
+indicator(title="OBQ RSI Signals", shorttitle="OBQ-RSI", overlay=false, max_labels_count=500)
+
+// ── INPUTS ────────────────────────────────────────────────────────────────────
+rsi_len   = input.int(14,    "RSI Length",       minval=2)
+ob_level  = input.int(70,    "Overbought",       minval=51)
+os_level  = input.int(30,    "Oversold",          maxval=49)
+show_div  = input.bool(false, "Show Divergences", tooltip="Last 3 divergence lines on RSI panel")
+piv_left  = input.int(3,     "Pivot Left Bars",  minval=1)
+piv_right = input.int(2,     "Pivot Right Bars",  minval=1)
+export_on = input.bool(false, "Export Labels",    tooltip="Enable for CDP data export")
+
+// ── 10-YEAR GATE ──────────────────────────────────────────────────────────────
+ten_y = timestamp("UTC", year(timenow) - 10, month(timenow), dayofmonth(timenow), 0, 0)
+in_win = time >= ten_y
+
+// ── RSI ───────────────────────────────────────────────────────────────────────
+rsi_val = ta.rsi(close, rsi_len)
+
+// ── LEVEL CROSSOVERS (called every bar — Pine v6 requirement) ─────────────────
+co_ob  = ta.crossover(rsi_val, ob_level)
+cu_ob  = ta.crossunder(rsi_val, ob_level)
+cu_os  = ta.crossunder(rsi_val, os_level)
+co_os  = ta.crossover(rsi_val, os_level)
+co_mid = ta.crossover(rsi_val, 50)
+cu_mid = ta.crossunder(rsi_val, 50)
+
+sig_ob_entry = in_win and barstate.isconfirmed and co_ob
+sig_ob_exit  = in_win and barstate.isconfirmed and cu_ob
+sig_os_entry = in_win and barstate.isconfirmed and cu_os
+sig_os_exit  = in_win and barstate.isconfirmed and co_os
+sig_mid_up   = in_win and barstate.isconfirmed and co_mid
+sig_mid_down = in_win and barstate.isconfirmed and cu_mid
+
+// ── PIVOTS (called every bar at top level — Pine v6 requirement) ──────────────
+pp_low  = ta.pivotlow(low, piv_left, piv_right)
+pp_high = ta.pivothigh(high, piv_left, piv_right)
+rp_low  = ta.pivotlow(rsi_val, piv_left, piv_right)
+rp_high = ta.pivothigh(rsi_val, piv_left, piv_right)
+
+// ── PIVOT STORAGE ─────────────────────────────────────────────────────────────
+var float[] lp_price = array.new_float(0)
+var float[] lp_rsi   = array.new_float(0)
+var int[]   lp_bar   = array.new_int(0)
+var float[] hp_price = array.new_float(0)
+var float[] hp_rsi   = array.new_float(0)
+var int[]   hp_bar   = array.new_int(0)
+
+// Store pivot lows when both price and RSI have a pivot
+if not na(pp_low) and not na(rp_low) and in_win and barstate.isconfirmed
+    array.push(lp_price, pp_low)
+    array.push(lp_rsi, rp_low)
+    array.push(lp_bar, bar_index - piv_right)
+    if array.size(lp_price) > 20
+        array.shift(lp_price)
+        array.shift(lp_rsi)
+        array.shift(lp_bar)
+
+// Store pivot highs when both price and RSI have a pivot
+if not na(pp_high) and not na(rp_high) and in_win and barstate.isconfirmed
+    array.push(hp_price, pp_high)
+    array.push(hp_rsi, rp_high)
+    array.push(hp_bar, bar_index - piv_right)
+    if array.size(hp_price) > 20
+        array.shift(hp_price)
+        array.shift(hp_rsi)
+        array.shift(hp_bar)
+
+// ── DIVERGENCE DETECTION ──────────────────────────────────────────────────────
+bull_div     = false
+bear_div     = false
+bull_rsi_val = float(na)
+bear_rsi_val = float(na)
+
+// Bullish: new price lower low + RSI higher low
+if not na(pp_low) and not na(rp_low) and in_win and barstate.isconfirmed
+    int n = array.size(lp_price)
+    if n >= 2
+        for i = 0 to n - 2
+            if pp_low < array.get(lp_price, i) and rp_low > array.get(lp_rsi, i)
+                bull_div := true
+                bull_rsi_val := rp_low
+                break
+
+// Bearish: new price higher high + RSI lower high
+if not na(pp_high) and not na(rp_high) and in_win and barstate.isconfirmed
+    int n2 = array.size(hp_price)
+    if n2 >= 2
+        for i = 0 to n2 - 2
+            if pp_high > array.get(hp_price, i) and rp_high < array.get(hp_rsi, i)
+                bear_div := true
+                bear_rsi_val := rp_high
+                break
+
+// ── DIVERGENCE LINES (last 3, toggle on/off) ─────────────────────────────────
+var int[]   d_b1 = array.new_int(0)
+var float[] d_r1 = array.new_float(0)
+var int[]   d_b2 = array.new_int(0)
+var float[] d_r2 = array.new_float(0)
+var int[]   d_tp = array.new_int(0)
+
+if bull_div
+    int nl = array.size(lp_bar)
+    if nl >= 2
+        array.push(d_b1, array.get(lp_bar, nl - 2))
+        array.push(d_r1, array.get(lp_rsi, nl - 2))
+        array.push(d_b2, bar_index - piv_right)
+        array.push(d_r2, bull_rsi_val)
+        array.push(d_tp, 1)
+        while array.size(d_b1) > 3
+            array.shift(d_b1)
+            array.shift(d_r1)
+            array.shift(d_b2)
+            array.shift(d_r2)
+            array.shift(d_tp)
+
+if bear_div
+    int nh = array.size(hp_bar)
+    if nh >= 2
+        array.push(d_b1, array.get(hp_bar, nh - 2))
+        array.push(d_r1, array.get(hp_rsi, nh - 2))
+        array.push(d_b2, bar_index - piv_right)
+        array.push(d_r2, bear_rsi_val)
+        array.push(d_tp, -1)
+        while array.size(d_b1) > 3
+            array.shift(d_b1)
+            array.shift(d_r1)
+            array.shift(d_b2)
+            array.shift(d_r2)
+            array.shift(d_tp)
+
+// Draw divergence lines on last bar
+var line[] div_lines = array.new_line(0)
+if barstate.islast
+    int ld = array.size(div_lines)
+    if ld > 0
+        for i = 0 to ld - 1
+            line.delete(array.get(div_lines, i))
+    array.clear(div_lines)
+    if show_div
+        int nd = array.size(d_b1)
+        if nd > 0
+            for i = 0 to nd - 1
+                color col = array.get(d_tp, i) == 1 ? color.new(#00C853, 0) : color.new(#D32F2F, 0)
+                line ln = line.new(array.get(d_b1, i), array.get(d_r1, i), array.get(d_b2, i), array.get(d_r2, i), xloc=xloc.bar_index, color=col, width=2, style=line.style_dashed)
+                array.push(div_lines, ln)
+
+// ── EXPORT LABELS ─────────────────────────────────────────────────────────────
+if export_on and barstate.isconfirmed and in_win
+    string sig = ""
+    float rsi_v = rsi_val
+    if sig_ob_entry
+        sig := "RSI_OB_ENTRY"
+    else if sig_ob_exit
+        sig := "RSI_OB_EXIT"
+    else if sig_os_entry
+        sig := "RSI_OS_ENTRY"
+    else if sig_os_exit
+        sig := "RSI_OS_EXIT"
+    else if sig_mid_up
+        sig := "RSI_MID_UP"
+    else if sig_mid_down
+        sig := "RSI_MID_DOWN"
+    else if bull_div
+        sig := "RSI_BULL_DIV"
+        rsi_v := bull_rsi_val
+    else if bear_div
+        sig := "RSI_BEAR_DIV"
+        rsi_v := bear_rsi_val
+    if sig != ""
+        label.new(bar_index, rsi_v, str.format("{0}|{1}|{2}|{3}", sig, str.format_time(time, "yyyy-MM-dd", "UTC"), str.tostring(math.round(close, 2)), str.tostring(math.round(rsi_v, 2))), style=label.style_label_down, color=color.new(color.gray, 90), textcolor=color.new(color.gray, 90), size=size.tiny)
+
+// ── PLOTS ─────────────────────────────────────────────────────────────────────
+plot(rsi_val, "RSI(14)", color=color.new(#1565C0, 0), linewidth=2)
+hline(ob_level, "OB", color=color.new(color.red, 50), linestyle=hline.style_dashed)
+hline(50, "Mid", color=color.new(color.gray, 60), linestyle=hline.style_dotted)
+hline(os_level, "OS", color=color.new(color.green, 50), linestyle=hline.style_dashed)
+bgcolor(rsi_val >= ob_level ? color.new(color.red, 93) : na, title="OB Zone")
+bgcolor(rsi_val <= os_level ? color.new(color.green, 93) : na, title="OS Zone")
+
+// ── SIGNAL DOTS ───────────────────────────────────────────────────────────────
+plotshape(sig_ob_entry, title="OB Entry >70", style=shape.circle, location=location.absolute, color=#D32F2F, size=size.tiny)
+plotshape(sig_ob_exit, title="OB Exit <70", style=shape.circle, location=location.absolute, color=#FF6D00, size=size.tiny)
+plotshape(sig_os_entry, title="OS Entry <30", style=shape.circle, location=location.absolute, color=#1565C0, size=size.tiny)
+plotshape(sig_os_exit, title="OS Exit >30", style=shape.circle, location=location.absolute, color=#00C853, size=size.tiny)
+plotshape(sig_mid_up, title="Mid Up >50", style=shape.circle, location=location.absolute, color=#00BCD4, size=size.tiny)
+plotshape(sig_mid_down, title="Mid Down <50", style=shape.circle, location=location.absolute, color=#7B1FA2, size=size.tiny)
+plotshape(bull_div ? bull_rsi_val : na, title="Bull Div", style=shape.triangleup, location=location.absolute, color=#00E676, size=size.small)
+plotshape(bear_div ? bear_rsi_val : na, title="Bear Div", style=shape.triangledown, location=location.absolute, color=#FF1744, size=size.small)
