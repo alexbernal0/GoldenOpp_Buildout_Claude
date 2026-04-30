@@ -1,0 +1,243 @@
+//@version=6
+// OBQ Forward Cloud v2 — Self-Calculating
+// Computes LIVE forward return distributions from full chart history.
+// Works on ANY ticker/timeframe. No hardcoded data.
+// Uses RSI + MACD + ADX + MA signals from the chart it's applied to.
+indicator("OBQ Forward Cloud v2", overlay=true,
+          max_lines_count=500, max_labels_count=20,
+          max_bars_back=5000)
+
+// ─── INPUTS ──────────────────────────────────────────────────────────────────
+i_source   = input.string("Composite", "Signal Source",
+             options=["RSI","MACD","ADX","MA","Composite"])
+i_fwd_bars = input.int(20,   "Projection Bars",  minval=5,   maxval=40)
+i_rsi_len  = input.int(14,   "RSI Length",       minval=2)
+i_ob       = input.int(70,   "RSI Overbought",   minval=50,  maxval=90)
+i_os       = input.int(30,   "RSI Oversold",     maxval=50,  minval=10)
+i_lookback = input.int(3000, "Max History Bars", minval=200, maxval=5000,
+             tooltip="How many bars of history to use. More = more signal instances.")
+
+// ─── INDICATOR CALCULATIONS ──────────────────────────────────────────────────
+rsi                        = ta.rsi(close, i_rsi_len)
+[macd_l, sig_l, hist]      = ta.macd(close, 12, 26, 9)
+[plus_di, minus_di, adx_v] = ta.dmi(14, 14)
+ma20                       = ta.sma(close, 20)
+ma50                       = ta.sma(close, 50)
+ma200                      = ta.sma(close, 200)
+
+// MA slope helpers
+slope_pct(float ma) =>
+    ma != 0 and not na(ma[3]) and ma[3] != 0 ? (ma - ma[3]) / ma[3] * 100 / 3 : 0.0
+
+slope_zone(float s) =>
+    if s > 0.12
+        2
+    else if s > 0.03
+        1
+    else if s >= -0.03
+        0
+    else if s >= -0.12
+        -1
+    else
+        -2
+
+z20  = slope_zone(slope_pct(ma20))
+z50  = slope_zone(slope_pct(ma50))
+pz20 = slope_zone(slope_pct(ma20[1]))
+pz50 = slope_zone(slope_pct(ma50[1]))
+
+// ─── SIGNAL DETECTION (edge-triggered — fires on entry bar only) ─────────────
+sig_rsi  = ta.crossover(rsi, i_os)      or ta.crossunder(rsi, i_ob)   or
+           ta.crossover(rsi, 50)         or ta.crossunder(rsi, 50)
+
+sig_macd = ta.crossover(macd_l, sig_l)  or ta.crossunder(macd_l, sig_l) or
+           ta.crossover(macd_l, 0)       or ta.crossunder(macd_l, 0)     or
+           (hist > 0 and hist > hist[1]) or (hist < 0 and hist < hist[1])
+
+sig_adx  = ta.crossover(adx_v, 20)      or ta.crossunder(adx_v, 20)    or
+           ta.crossover(adx_v, 40)       or
+           ta.crossover(plus_di, minus_di) or ta.crossover(minus_di, plus_di)
+
+sig_ma   = ta.crossover(ma20, ma200)    or ta.crossunder(ma20, ma200)   or
+           ta.crossover(ma20, ma50)     or ta.crossunder(ma20, ma50)    or
+           ta.crossover(close, ma20)    or ta.crossunder(close, ma20)   or
+           (pz20 != z20)                or (pz50 != z50)
+
+sig_all  = sig_rsi or sig_macd or sig_adx or sig_ma
+
+sig_active = i_source == "RSI"  ? sig_rsi  :
+             i_source == "MACD" ? sig_macd :
+             i_source == "ADX"  ? sig_adx  :
+             i_source == "MA"   ? sig_ma   : sig_all
+
+// ─── ACCUMULATE SIGNAL BAR INDICES ───────────────────────────────────────────
+var int[] sig_bars = array.new<int>()
+
+if barstate.isconfirmed and sig_active and bar_index >= i_fwd_bars
+    if array.size(sig_bars) < i_lookback
+        array.push(sig_bars, bar_index)
+
+// ─── PERCENTILE ARRAYS (populated on last bar) ───────────────────────────────
+var float[] fwd_p10  = array.new<float>()
+var float[] fwd_p25  = array.new<float>()
+var float[] fwd_p50  = array.new<float>()
+var float[] fwd_p75  = array.new<float>()
+var float[] fwd_p90  = array.new<float>()
+var float[] fwd_mean = array.new<float>()
+
+// ─── COMPUTE ON LAST BAR ─────────────────────────────────────────────────────
+var bool cloud_drawn = false
+
+if barstate.islast and not cloud_drawn
+    cloud_drawn := true
+
+    int n_sigs = array.size(sig_bars)
+    int n_fwd  = i_fwd_bars
+
+    if n_sigs >= 5
+        array.clear(fwd_p10)
+        array.clear(fwd_p25)
+        array.clear(fwd_p50)
+        array.clear(fwd_p75)
+        array.clear(fwd_p90)
+        array.clear(fwd_mean)
+
+        // For each forward offset d (1 to n_fwd)
+        for d = 1 to n_fwd
+            float[] returns_at_d = array.new<float>()
+
+            for si = 0 to n_sigs - 1
+                int sig_bi          = array.get(sig_bars, si)
+                int bars_ago_signal = bar_index - sig_bi
+                int bars_ago_fwd    = bars_ago_signal - d
+
+                // Only include complete windows (signal+d is before current bar)
+                if bars_ago_fwd >= 0 and bars_ago_fwd <= 4990
+                    float sig_close = close[bars_ago_signal]
+                    float fwd_close = close[bars_ago_fwd]
+
+                    if sig_close > 0 and not na(sig_close) and not na(fwd_close)
+                        float ret = (fwd_close - sig_close) / sig_close * 100.0
+                        array.push(returns_at_d, ret)
+
+            int nd = array.size(returns_at_d)
+            if nd >= 5
+                array.sort(returns_at_d)
+                int i10 = math.max(0, math.min(math.round(nd * 0.10), nd - 1))
+                int i25 = math.max(0, math.min(math.round(nd * 0.25), nd - 1))
+                int i50 = math.max(0, math.min(math.round(nd * 0.50), nd - 1))
+                int i75 = math.max(0, math.min(math.round(nd * 0.75), nd - 1))
+                int i90 = math.max(0, math.min(math.round(nd * 0.90), nd - 1))
+
+                array.push(fwd_p10,  array.get(returns_at_d, i10))
+                array.push(fwd_p25,  array.get(returns_at_d, i25))
+                array.push(fwd_p50,  array.get(returns_at_d, i50))
+                array.push(fwd_p75,  array.get(returns_at_d, i75))
+                array.push(fwd_p90,  array.get(returns_at_d, i90))
+
+                // Manual mean (array.mean not available in Pine v6)
+                float sum_r = 0.0
+                for ri = 0 to nd - 1
+                    sum_r += array.get(returns_at_d, ri)
+                array.push(fwd_mean, sum_r / nd)
+            else
+                array.push(fwd_p10,  0.0)
+                array.push(fwd_p25,  0.0)
+                array.push(fwd_p50,  0.0)
+                array.push(fwd_p75,  0.0)
+                array.push(fwd_p90,  0.0)
+                array.push(fwd_mean, 0.0)
+
+        // ── DRAW CLOUD ────────────────────────────────────────────────────────
+        int   b0      = bar_index
+        float base    = close
+        int   n_draws = array.size(fwd_p10)
+
+        // Colors by source
+        color col_outer  = i_source == "Composite" ? color.new(#6A1B9A, 82) :
+                           i_source == "MA"         ? color.new(#1B5E20, 82) :
+                           color.new(#1565C0, 85)
+        color col_inner  = i_source == "Composite" ? color.new(#6A1B9A, 72) :
+                           i_source == "MA"         ? color.new(#1B5E20, 72) :
+                           color.new(#1565C0, 75)
+        color col_fill_o = i_source == "Composite" ? color.new(#6A1B9A, 88) :
+                           i_source == "MA"         ? color.new(#1B5E20, 88) :
+                           color.new(#1565C0, 90)
+        color col_fill_i = i_source == "Composite" ? color.new(#6A1B9A, 80) :
+                           i_source == "MA"         ? color.new(#1B5E20, 80) :
+                           color.new(#1565C0, 80)
+        color col_med    = i_source == "Composite" ? color.new(#6A1B9A, 25) :
+                           i_source == "MA"         ? color.new(#1B5E20, 25) :
+                           color.new(#1565C0, 30)
+        color col_mean   = i_source == "Composite" ? color.new(#4A148C,  0) :
+                           i_source == "MA"         ? color.new(#1B5E20,  0) :
+                           color.new(#0D47A1, 0)
+
+        if n_draws >= 2
+            // Outer band: p10–p90
+            for i = 0 to n_draws - 2
+                float y90a = base * (1.0 + array.get(fwd_p90, i)     / 100.0)
+                float y90b = base * (1.0 + array.get(fwd_p90, i + 1) / 100.0)
+                float y10a = base * (1.0 + array.get(fwd_p10, i)     / 100.0)
+                float y10b = base * (1.0 + array.get(fwd_p10, i + 1) / 100.0)
+                line lt = line.new(b0+i+1, y90a, b0+i+2, y90b, color=col_outer, width=1)
+                line lb = line.new(b0+i+1, y10a, b0+i+2, y10b, color=col_outer, width=1)
+                linefill.new(lt, lb, color=col_fill_o)
+
+            // Inner band: p25–p75
+            for i = 0 to n_draws - 2
+                float y75a = base * (1.0 + array.get(fwd_p75, i)     / 100.0)
+                float y75b = base * (1.0 + array.get(fwd_p75, i + 1) / 100.0)
+                float y25a = base * (1.0 + array.get(fwd_p25, i)     / 100.0)
+                float y25b = base * (1.0 + array.get(fwd_p25, i + 1) / 100.0)
+                line t2 = line.new(b0+i+1, y75a, b0+i+2, y75b, color=col_inner, width=1)
+                line b2 = line.new(b0+i+1, y25a, b0+i+2, y25b, color=col_inner, width=1)
+                linefill.new(t2, b2, color=col_fill_i)
+
+            // Median line (dashed)
+            for i = 0 to n_draws - 2
+                float y50a = base * (1.0 + array.get(fwd_p50, i)     / 100.0)
+                float y50b = base * (1.0 + array.get(fwd_p50, i + 1) / 100.0)
+                line.new(b0+i+1, y50a, b0+i+2, y50b,
+                         color=col_med, width=1, style=line.style_dashed)
+
+            // Mean line (solid, thicker)
+            for i = 0 to n_draws - 2
+                float ymna = base * (1.0 + array.get(fwd_mean, i)     / 100.0)
+                float ymnb = base * (1.0 + array.get(fwd_mean, i + 1) / 100.0)
+                line.new(b0+i+1, ymna, b0+i+2, ymnb, color=col_mean, width=2)
+
+            // Anchor dot
+            line.new(b0, base, b0+1,
+                     base * (1.0 + array.get(fwd_mean, 0) / 100.0),
+                     color=color.new(color.gray, 50), width=1, style=line.style_dotted)
+
+            // Count valid instances (complete forward windows only)
+            int valid_n  = 0
+            int win_count = 0
+            for si = 0 to n_sigs - 1
+                int sig_bi    = array.get(sig_bars, si)
+                int bars_back = bar_index - sig_bi - n_fwd
+                if bars_back >= 0 and bars_back <= 4990
+                    valid_n += 1
+                    float sc = close[bar_index - sig_bi]
+                    float fc = close[bars_back]
+                    if not na(sc) and not na(fc) and sc > 0
+                        if fc > sc
+                            win_count += 1
+
+            int win_pct = valid_n > 0 ? math.round(win_count / valid_n * 100) : 0
+
+            float mean_end = base * (1.0 + array.get(fwd_mean, n_draws - 1) / 100.0)
+            float mean_ret = array.get(fwd_mean, n_draws - 1)
+
+            string lbl = i_source + " Cloud | $" +
+                         str.tostring(math.round(mean_end, 2)) +
+                         " (" + (mean_ret >= 0 ? "+" : "") +
+                         str.tostring(math.round(mean_ret, 1)) + "%)" +
+                         " | n=" + str.tostring(valid_n) +
+                         " w=" + str.tostring(win_pct) + "%"
+
+            label.new(b0 + n_fwd, mean_end, lbl,
+                      style=label.style_label_left,
+                      color=col_mean, textcolor=color.white, size=size.small)
