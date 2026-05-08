@@ -1,0 +1,183 @@
+//@version=6
+indicator("OBQ MA Suite", shorttitle="OBQ-MA", overlay=true, max_labels_count=500)
+
+// ─── INPUTS ──────────────────────────────────────────────────────────────────
+ma20_len  = input.int(20,  "MA 20 Length")
+ma50_len  = input.int(50,  "MA 50 Length")
+ma200_len = input.int(200, "MA 200 Length")
+
+// Slope thresholds — % change per bar (smoothed over 3 bars)
+// Empirically derived from mining stock daily distributions
+slope_flat  = input.float(0.03, "Flat threshold %",  minval=0.01, maxval=0.5, step=0.01,
+              tooltip="Slope within ±this% per bar = FLAT zone")
+slope_mild  = input.float(0.12, "Mild threshold %",  minval=0.01, maxval=1.0, step=0.01,
+              tooltip="Slope between flat and this% = Q1 (mild). Above = Q2 (strong).")
+
+show_mas     = input.bool(true, "Show MA lines")
+export_on    = input.bool(false,"Export Labels", tooltip="Enable for forward cloud data export")
+
+// ─── MA CALCULATIONS ─────────────────────────────────────────────────────────
+ma20  = ta.sma(close, ma20_len)
+ma50  = ta.sma(close, ma50_len)
+ma200 = ta.sma(close, ma200_len)
+
+// ─── SLOPE (% change per bar, smoothed over 3 bars to reduce noise) ──────────
+slope_pct(float ma) =>
+    ma != 0 and not na(ma[3]) ? (ma - ma[3]) / ma[3] * 100 / 3 : 0.0
+
+s20  = slope_pct(ma20)
+s50  = slope_pct(ma50)
+s200 = slope_pct(ma200)
+
+// ─── SLOPE ZONE ──────────────────────────────────────────────────────────────
+// Returns: -2=Q2D, -1=Q1D, 0=FLAT, 1=Q1U, 2=Q2U
+slope_zone(float s) =>
+    if s > slope_mild
+        2
+    else if s > slope_flat
+        1
+    else if s >= -slope_flat
+        0
+    else if s >= -slope_mild
+        -1
+    else
+        -2
+
+z20  = slope_zone(s20)
+z50  = slope_zone(s50)
+z200 = slope_zone(s200)
+
+pz20  = slope_zone(slope_pct(ma20[1]))
+pz50  = slope_zone(slope_pct(ma50[1]))
+pz200 = slope_zone(slope_pct(ma200[1]))
+
+// ─── EDGE-TRIGGERED SIGNALS — fires ONCE on zone ENTRY only ──────────────────
+// Rule: signal = true ONLY on the bar zone changes. False every other bar.
+ma20_q2d   = pz20 != -2 and z20 == -2
+ma20_q1d   = pz20 != -1 and z20 == -1
+ma20_flat  = pz20 !=  0 and z20 ==  0
+ma20_q1u   = pz20 !=  1 and z20 ==  1
+ma20_q2u   = pz20 !=  2 and z20 ==  2
+
+ma50_q2d   = pz50 != -2 and z50 == -2
+ma50_q1d   = pz50 != -1 and z50 == -1
+ma50_flat  = pz50 !=  0 and z50 ==  0
+ma50_q1u   = pz50 !=  1 and z50 ==  1
+ma50_q2u   = pz50 !=  2 and z50 ==  2
+
+ma200_q2d  = pz200 != -2 and z200 == -2
+ma200_q1d  = pz200 != -1 and z200 == -1
+ma200_flat = pz200 !=  0 and z200 ==  0
+ma200_q1u  = pz200 !=  1 and z200 ==  1
+ma200_q2u  = pz200 !=  2 and z200 ==  2
+
+// Crossovers — already edge-triggered by nature
+ma20_x_ma50_bull  = ta.crossover(ma20,  ma50)
+ma20_x_ma50_bear  = ta.crossunder(ma20, ma50)
+ma20_x_ma200_bull = ta.crossover(ma20,  ma200)   // golden cross
+ma20_x_ma200_bear = ta.crossunder(ma20, ma200)   // death cross
+ma50_x_ma200_bull = ta.crossover(ma50,  ma200)
+ma50_x_ma200_bear = ta.crossunder(ma50, ma200)
+
+// Price vs MA crossovers
+price_x_ma20_bull  = ta.crossover(close,  ma20)
+price_x_ma20_bear  = ta.crossunder(close, ma20)
+price_x_ma50_bull  = ta.crossover(close,  ma50)
+price_x_ma50_bear  = ta.crossunder(close, ma50)
+price_x_ma200_bull = ta.crossover(close,  ma200)
+price_x_ma200_bear = ta.crossunder(close, ma200)
+
+// Stack alignment — edge-triggered on ENTRY only
+stack_bull_state = ma20 > ma50 and ma50 > ma200 and z20 >= 0 and z50 >= 0
+stack_bear_state = ma20 < ma50 and ma50 < ma200 and z20 <= 0 and z50 <= 0
+
+stack_bull = not stack_bull_state[1] and stack_bull_state
+stack_bear = not stack_bear_state[1] and stack_bear_state
+
+// ─── EXPORT LABELS (AI pipeline format — same as OBQ RSI/MACD/ADX) ───────────
+export_signal(string sig, float val) =>
+    if export_on and barstate.isconfirmed
+        label.new(bar_index, val,
+                  str.format("{0}|{1}|{2}|{3}", sig,
+                      str.format_time(time, "yyyy-MM-dd", "UTC"),
+                      str.tostring(math.round(close, 2)),
+                      str.tostring(math.round(val, 2))),
+                  style=label.style_label_down,
+                  color=color.new(color.gray, 90),
+                  textcolor=color.new(color.gray, 90),
+                  size=size.tiny)
+
+// Slope zone entries
+if ma20_q2d
+    export_signal("MA20_Q2D",  ma20)
+if ma20_q1d
+    export_signal("MA20_Q1D",  ma20)
+if ma20_flat
+    export_signal("MA20_FLAT", ma20)
+if ma20_q1u
+    export_signal("MA20_Q1U",  ma20)
+if ma20_q2u
+    export_signal("MA20_Q2U",  ma20)
+
+if ma50_q2d
+    export_signal("MA50_Q2D",  ma50)
+if ma50_q1d
+    export_signal("MA50_Q1D",  ma50)
+if ma50_flat
+    export_signal("MA50_FLAT", ma50)
+if ma50_q1u
+    export_signal("MA50_Q1U",  ma50)
+if ma50_q2u
+    export_signal("MA50_Q2U",  ma50)
+
+if ma200_q2d
+    export_signal("MA200_Q2D",  ma200)
+if ma200_q1d
+    export_signal("MA200_Q1D",  ma200)
+if ma200_flat
+    export_signal("MA200_FLAT", ma200)
+if ma200_q1u
+    export_signal("MA200_Q1U",  ma200)
+if ma200_q2u
+    export_signal("MA200_Q2U",  ma200)
+
+// Crossovers
+if ma20_x_ma50_bull
+    export_signal("MA20_X_MA50_BULL",  ma20)
+if ma20_x_ma50_bear
+    export_signal("MA20_X_MA50_BEAR",  ma20)
+if ma20_x_ma200_bull
+    export_signal("MA20_X_MA200_BULL", ma20)
+if ma20_x_ma200_bear
+    export_signal("MA20_X_MA200_BEAR", ma20)
+if ma50_x_ma200_bull
+    export_signal("MA50_X_MA200_BULL", ma50)
+if ma50_x_ma200_bear
+    export_signal("MA50_X_MA200_BEAR", ma50)
+
+// Price crossovers
+if price_x_ma20_bull
+    export_signal("PRICE_X_MA20_BULL",  ma20)
+if price_x_ma20_bear
+    export_signal("PRICE_X_MA20_BEAR",  ma20)
+if price_x_ma50_bull
+    export_signal("PRICE_X_MA50_BULL",  ma50)
+if price_x_ma50_bear
+    export_signal("PRICE_X_MA50_BEAR",  ma50)
+if price_x_ma200_bull
+    export_signal("PRICE_X_MA200_BULL", ma200)
+if price_x_ma200_bear
+    export_signal("PRICE_X_MA200_BEAR", ma200)
+
+// Stack
+if stack_bull
+    export_signal("STACK_BULL", ma20)
+if stack_bear
+    export_signal("STACK_BEAR", ma20)
+
+// No chart markers — clean chart, signals exported via labels only (Export Labels = true)
+
+// ─── PLOTS ───────────────────────────────────────────────────────────────────
+plot(show_mas ? ma20  : na, "MA 20",  color=color.new(#2962FF, 0), linewidth=1)
+plot(show_mas ? ma50  : na, "MA 50",  color=color.new(#FF6D00, 0), linewidth=1)
+plot(show_mas ? ma200 : na, "MA 200", color=color.new(#F44336, 0), linewidth=2)

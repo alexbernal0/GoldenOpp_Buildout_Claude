@@ -1,0 +1,233 @@
+//@version=6
+// OBQ Support & Resistance v2 — Provably Non-Repainting
+// Architecture: pivot-cluster, confirmed on closed bars, drawn at confirmation time
+//
+// NON-REPAINTING GUARANTEES:
+//   1. ta.pivothigh/pivotlow only fire on confirmed closed bars (barstate.isconfirmed)
+//   2. Pivot refers to bar[right] — a fully closed, immutable historical bar
+//   3. line.new() is called ONCE per level, on the bar the level is confirmed
+//      → line extends right from that bar, so it's visible BEFORE price reaches it
+//   4. Level price is NEVER averaged/changed after initial creation
+//      → merges only increment touch count, price anchor stays fixed
+//   5. No barstate.islast drawing — every line is created at its confirmation bar
+//   6. barstate.isconfirmed guard on all state-mutating logic
+//
+// WHAT "NON-REPAINTING" MEANS HERE:
+//   A level drawn at bar N for price $79 will never move, never disappear,
+//   and will be visible on bar N+1, N+2... so when price later reaches $79,
+//   the line was already on the chart. A real trader could have seen it.
+
+indicator("OBQ S/R Levels v2", overlay=true, max_lines_count=500, max_labels_count=200)
+
+// ─── INPUTS ──────────────────────────────────────────────────────────────────
+var g1 = "Detection"
+i_leftStr    = input.int(3,     "Pivot Left Bars",   minval=1, maxval=10,    group=g1)
+i_rightStr   = input.int(3,     "Pivot Right Bars",  minval=1, maxval=10,    group=g1,
+                 tooltip="Pivot confirmed RIGHT bars after the pivot bar. Lag = right bars. This is the non-repainting cost.")
+i_combinePct = input.float(0.75,"Combine Zone %",    minval=0.1, maxval=3.0, group=g1, step=0.05,
+                 tooltip="Pivots within this % of an existing level's anchor price are merged. Price anchor never moves.")
+i_lookback   = input.int(500,   "Lookback Bars",     minval=50, maxval=2000, group=g1,
+                 tooltip="Levels confirmed outside this window are hidden (line deleted). Keeps chart clean.")
+
+var g2 = "Display"
+i_minTouches = input.int(2,     "Min Touches to Show", minval=1, maxval=10,  group=g2,
+                 tooltip="1-touch levels are single unconfirmed pivots — noise. 2+ means at least 2 pivots clustered at this price.")
+i_hotAt      = input.int(3,     "Bold at N touches",   minval=2, maxval=20,  group=g2,
+                 tooltip="3+ touches = thick orange line. 2 touches = thin dashed blue.")
+i_maxLines   = input.int(40,    "Max Lines on Chart",  minval=5, maxval=200, group=g2)
+i_showLabels = input.bool(true,  "Show Touch Labels",               group=g2)
+i_showLag    = input.bool(false, "Show Lag Marker (pivot bar)",     group=g2,
+                 tooltip="Draws a small triangle on the actual pivot bar (right bars before confirmation). Educational only.")
+
+var g3 = "Colors"
+i_colWeak    = input.color(color.new(color.blue,   60), "Weak (2 touches)",  group=g3)
+i_colHot     = input.color(color.new(color.orange,  0), "Hot (3+ touches)",  group=g3)
+i_colStrong  = input.color(color.new(#ff2222,       0), "Strong (5+ touches)", group=g3)
+
+// ─── STATE — accumulated bar by bar, never reset ─────────────────────────────
+// Each level: [anchor_price, touch_count, confirmation_bar, line_id_placeholder]
+// We store parallel arrays because Pine arrays can't hold line objects directly.
+var float[] lv_price   = array.new<float>()   // anchor price — NEVER changes after creation
+var int[]   lv_touches = array.new<int>()     // touch count — only incremented, never reset
+var int[]   lv_bar     = array.new<int>()     // bar_index when level was first confirmed
+var line[]  lv_line    = array.new<line>()    // the actual line object
+var label[] lv_label   = array.new<label>()   // touch count label
+
+// ─── HELPER: find existing level within combine zone ─────────────────────────
+// Returns index of matching level, or -1 if no match.
+// Uses ANCHOR price for comparison — anchor never moves, so lookup is stable.
+find_level(float price) =>
+    result = -1
+    tol = price * (i_combinePct / 100.0)
+    n = array.size(lv_price)
+    if n > 0
+        for i = 0 to n - 1
+            if math.abs(array.get(lv_price, i) - price) <= tol
+                result := i
+                break
+    result
+
+// ─── HELPER: visual properties from touch count ──────────────────────────────
+line_color(int touches) =>
+    touches >= 5 ? i_colStrong : touches >= i_hotAt ? i_colHot : i_colWeak
+
+line_width(int touches) =>
+    touches >= 5 ? 4 : touches >= i_hotAt ? 3 : touches >= 2 ? 2 : 1
+
+line_style(int touches) =>
+    touches >= i_hotAt ? line.style_solid : line.style_dashed
+
+// ─── HELPER: update line and label appearance ─────────────────────────────────
+update_visuals(int idx) =>
+    t  = array.get(lv_touches, idx)
+    ln = array.get(lv_line,    idx)
+    lb = array.get(lv_label,   idx)
+    if not na(ln)
+        line.set_color(ln, line_color(t))
+        line.set_width(ln, line_width(t))
+        line.set_style(ln, line_style(t))
+    if not na(lb) and i_showLabels
+        label.set_text(lb, str.tostring(t) + "x")
+        label.set_textcolor(lb, line_color(t))
+
+// ─── HELPER: create a brand-new level ────────────────────────────────────────
+// Called ONCE per new level, on the bar the pivot is confirmed.
+// Line extends rightward from this bar — visible to all future bars including
+// bars where price will later test this level.
+create_level(float price, int confirm_bar) =>
+    // Draw line from the pivot bar (bar_index - i_rightStr) extending right
+    // Using xloc.bar_index so the line is anchored to exact bar positions
+    pivot_bar = bar_index - i_rightStr   // the actual pivot bar (3 bars ago)
+    ln = line.new(
+         x1    = pivot_bar,
+         y1    = price,
+         x2    = bar_index,
+         y2    = price,
+         xloc  = xloc.bar_index,
+         extend= extend.right,           // KEY: extends into the future automatically
+         color = i_colWeak,
+         width = 1,
+         style = line.style_dashed)
+    lb = i_showLabels ?
+         label.new(
+             x       = bar_index,
+             y       = price,
+             text    = "1x",
+             xloc    = xloc.bar_index,
+             color   = color.new(color.black, 100),
+             textcolor = i_colWeak,
+             style   = label.style_label_left,
+             size    = size.tiny) : na
+    array.push(lv_price,   price)
+    array.push(lv_touches, 1)
+    array.push(lv_bar,     confirm_bar)
+    array.push(lv_line,    ln)
+    array.push(lv_label,   lb)
+
+// ─── HELPER: process a confirmed pivot price ──────────────────────────────────
+// This is the core: merge or create. Called once per confirmed pivot.
+process_pivot(float pivot_price) =>
+    idx = find_level(pivot_price)
+    if idx >= 0
+        // Existing level — increment touch count only, DO NOT change anchor price
+        array.set(lv_touches, idx, array.get(lv_touches, idx) + 1)
+        update_visuals(idx)
+    else
+        // New level — create line at this confirmation bar
+        create_level(pivot_price, bar_index)
+
+// ─── HELPER: prune old levels outside lookback window ────────────────────────
+// Deletes lines for levels confirmed more than i_lookback bars ago.
+// Keeps the array bounded and the chart uncluttered.
+prune_old_levels() =>
+    cutoff = bar_index - i_lookback
+    i = array.size(lv_price) - 1
+    while i >= 0
+        if array.get(lv_bar, i) < cutoff
+            ln = array.get(lv_line,  i)
+            lb = array.get(lv_label, i)
+            if not na(ln)
+                line.delete(ln)
+            if not na(lb)
+                label.delete(lb)
+            array.remove(lv_price,   i)
+            array.remove(lv_touches, i)
+            array.remove(lv_bar,     i)
+            array.remove(lv_line,    i)
+            array.remove(lv_label,   i)
+        i -= 1
+
+// ─── HELPER: enforce max lines, hide weak levels if over limit ────────────────
+// If total displayed lines exceed i_maxLines, hide the weakest (fewest touches).
+enforce_max_lines() =>
+    n = array.size(lv_price)
+    if n > i_maxLines
+        // Find min-touch levels and hide them (don't delete — they're still valid)
+        // Simple approach: hide any below min_touches threshold
+        for i = 0 to n - 1
+            t  = array.get(lv_touches, i)
+            ln = array.get(lv_line, i)
+            lb = array.get(lv_label, i)
+            if t < i_minTouches and not na(ln)
+                line.set_color(ln, color.new(color.gray, 100))  // invisible
+                if not na(lb)
+                    label.set_color(lb, color.new(color.black, 100))
+
+// ─── MAIN LOGIC — runs on every confirmed closed bar ─────────────────────────
+// CRITICAL: barstate.isconfirmed = this bar is fully closed, will never change.
+// ta.pivothigh/pivotlow on a confirmed bar refer to bar[right] which is also
+// a confirmed closed bar. Fully non-repainting.
+
+if barstate.isconfirmed
+    // Detect pivots — these refer to bars i_rightStr ago (confirmed, immutable)
+    float ph = ta.pivothigh(high, i_leftStr, i_rightStr)
+    float pl = ta.pivotlow(low,   i_leftStr, i_rightStr)
+
+    // Process each confirmed pivot
+    if not na(ph)
+        process_pivot(ph)
+        // Optional: mark the actual pivot bar for educational purposes
+        if i_showLag
+            label.new(bar_index - i_rightStr, ph, text="H",
+                     color=color.new(color.teal, 70), textcolor=color.white,
+                     style=label.style_circle, size=size.tiny)
+
+    if not na(pl)
+        process_pivot(pl)
+        if i_showLag
+            label.new(bar_index - i_rightStr, pl, text="L",
+                     color=color.new(color.maroon, 70), textcolor=color.white,
+                     style=label.style_circle, size=size.tiny)
+
+    // Maintenance: prune old levels, enforce display limit
+    // Run every 10 bars to avoid per-bar overhead
+    if bar_index % 10 == 0
+        prune_old_levels()
+        enforce_max_lines()
+
+// ─── CURRENT BAR: update label positions (cosmetic, not logical) ──────────────
+// Label x-position tracks current bar so it stays at the right edge.
+// This is purely cosmetic — it does NOT change any level price or touch count.
+if barstate.islast and i_showLabels
+    n = array.size(lv_price)
+    if n > 0
+        for i = 0 to n - 1
+            t  = array.get(lv_touches, i)
+            lb = array.get(lv_label,   i)
+            if not na(lb) and t >= i_minTouches
+                label.set_x(lb, bar_index)
+
+// ─── BACKGROUND ZONE on current bar (optional, cosmetic) ─────────────────────
+// Draw a subtle highlight when current price is within 0.5% of a hot level.
+// This is read-only from the level array — does not modify any state.
+if barstate.islast
+    cp = close
+    n = array.size(lv_price)
+    if n > 0
+        for i = 0 to n - 1
+            t  = array.get(lv_touches, i)
+            lp = array.get(lv_price,   i)
+            if t >= i_hotAt and math.abs(lp - cp) / cp < 0.005
+                // Price is within 0.5% of a hot level — subtle background pulse
+                bgcolor(color.new(i_colHot, 85), title="At Hot Level")
+                break

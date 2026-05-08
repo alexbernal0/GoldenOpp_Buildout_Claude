@@ -1,0 +1,91 @@
+//@version=6
+indicator(title="OBQ ADX Signals", shorttitle="OBQ-ADX", overlay=false, max_labels_count=500)
+
+// ── INPUTS ────────────────────────────────────────────────────────────────────
+adx_len   = input.int(14,   "ADX Length",        minval=1)
+di_len    = input.int(14,   "DI Length",         minval=1)
+trnd_str  = input.int(20,   "Trend Threshold",   minval=1, tooltip="ADX above this = trending")
+trnd_stng = input.int(40,   "Strong Threshold",  minval=1, tooltip="ADX above this = strong trend")
+export_on = input.bool(false,"Export Labels",    tooltip="Enable for forward cloud data export")
+
+// ── 10-YEAR GATE ──────────────────────────────────────────────────────────────
+ten_y  = timestamp("UTC", year(timenow)-10, month(timenow), dayofmonth(timenow), 0, 0)
+in_win = time >= ten_y
+
+// ── ADX / DI CALCULATION ──────────────────────────────────────────────────────
+// Pine v6: ta.dmi() returns [+DI, -DI, ADX]
+[plus_di, minus_di, adx_val] = ta.dmi(di_len, adx_len)
+
+// ── CROSSOVER SIGNALS (every bar — Pine v6 requirement) ──────────────────────
+_co_trend  = ta.crossover(adx_val,  trnd_str)
+_cu_trend  = ta.crossunder(adx_val, trnd_str)
+_co_strong = ta.crossover(adx_val,  trnd_stng)
+_co_di_bull = ta.crossover(plus_di,  minus_di)
+_co_di_bear = ta.crossover(minus_di, plus_di)
+
+adx_trend_start  = in_win and barstate.isconfirmed and _co_trend
+adx_trend_weak   = in_win and barstate.isconfirmed and _cu_trend
+adx_trend_strong = in_win and barstate.isconfirmed and _co_strong
+adx_di_bull_cross = in_win and barstate.isconfirmed and _co_di_bull
+adx_di_bear_cross = in_win and barstate.isconfirmed and _co_di_bear
+
+// ── TREND PEAK: ADX was above strong threshold, now turning down ──────────────
+adx_prev  = adx_val[1]
+adx_peak  = in_win and barstate.isconfirmed and adx_val < adx_prev and adx_prev >= trnd_stng and adx_val >= trnd_stng
+
+// ── DI EXPANSION SIGNALS ──────────────────────────────────────────────────────
+pdi_prev = plus_di[1]
+mdi_prev = minus_di[1]
+adx_di_bull_expand = in_win and barstate.isconfirmed and adx_val > trnd_str and plus_di > pdi_prev and minus_di < mdi_prev
+adx_di_bear_expand = in_win and barstate.isconfirmed and adx_val > trnd_str and minus_di > mdi_prev and plus_di < pdi_prev
+
+// ── EXPORT LABELS ─────────────────────────────────────────────────────────────
+if export_on and barstate.isconfirmed and in_win
+    string sig = ""
+    float val  = adx_val
+    if adx_trend_start
+        sig := "ADX_TREND_START"
+    else if adx_trend_strong
+        sig := "ADX_TREND_STRONG"
+    else if adx_trend_weak
+        sig := "ADX_TREND_WEAK"
+    else if adx_peak
+        sig := "ADX_TREND_PEAK"
+    else if adx_di_bull_cross
+        sig := "ADX_DI_BULL_CROSS"
+    else if adx_di_bear_cross
+        sig := "ADX_DI_BEAR_CROSS"
+    else if adx_di_bull_expand
+        sig := "ADX_DI_BULL_EXPAND"
+    else if adx_di_bear_expand
+        sig := "ADX_DI_BEAR_EXPAND"
+    if sig != ""
+        label.new(bar_index, val,
+                  str.format("{0}|{1}|{2}|{3}", sig,
+                      str.format_time(time, "yyyy-MM-dd", "UTC"),
+                      str.tostring(math.round(close, 2)),
+                      str.tostring(math.round(val, 2))),
+                  style=label.style_label_down,
+                  color=color.new(color.gray, 90),
+                  textcolor=color.new(color.gray, 90),
+                  size=size.tiny)
+
+// ── PLOTS ─────────────────────────────────────────────────────────────────────
+plot(adx_val,  "ADX",  color=color.new(#F5A623, 0), linewidth=2)
+plot(plus_di,  "+DI",  color=color.new(#26A69A, 0), linewidth=1)
+plot(minus_di, "-DI",  color=color.new(#EF5350, 0), linewidth=1)
+
+hline(trnd_stng, "Strong Trend", color=color.new(color.red,   60), linestyle=hline.style_dashed)
+hline(trnd_str,  "Trend Start",  color=color.new(color.gray,  60), linestyle=hline.style_dotted)
+
+bgcolor(adx_val >= trnd_stng ? color.new(color.orange, 93) : na, title="Strong Trend Zone")
+
+// ── SIGNAL DOTS ───────────────────────────────────────────────────────────────
+plotshape(adx_trend_start,   title="Trend Start (>20)",   style=shape.circle,       location=location.absolute, color=#00BCD4, size=size.tiny)
+plotshape(adx_trend_strong,  title="Trend Strong (>40)",  style=shape.circle,       location=location.absolute, color=#FF6D00, size=size.tiny)
+plotshape(adx_trend_weak,    title="Trend Weak (<20)",    style=shape.circle,       location=location.absolute, color=#7B1FA2, size=size.tiny)
+plotshape(adx_peak,          title="Trend Peak",          style=shape.xcross,       location=location.absolute, color=#D32F2F, size=size.tiny)
+plotshape(adx_di_bull_cross, title="+DI Cross Bull",      style=shape.triangleup,   location=location.absolute, color=#00C853, size=size.small)
+plotshape(adx_di_bear_cross, title="-DI Cross Bear",      style=shape.triangledown, location=location.absolute, color=#FF1744, size=size.small)
+plotshape(adx_di_bull_expand, title="DI Bull Expand",     style=shape.circle,       location=location.absolute, color=#00E676, size=size.tiny)
+plotshape(adx_di_bear_expand, title="DI Bear Expand",     style=shape.circle,       location=location.absolute, color=#F44336, size=size.tiny)
